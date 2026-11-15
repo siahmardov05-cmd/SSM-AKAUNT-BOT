@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Бот со складом аккаунтов + автоотправка в каналы + платные клиенты (подписки).
+Бот со складом аккаунтов (КПМ1 / КПМ2) + автоотправка в каналы + платные клиенты.
 Только стандартная библиотека Python (requirements.txt не нужен).
 
 Переменные окружения (Railway -> Variables):
@@ -24,6 +24,9 @@ API = "https://api.telegram.org/bot%s/" % TOKEN
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "5"))
 DEFAULT_INTERVAL = 5  # минут
+KINDS = (1, 2)
+
+SUPPORT_USER = "@CPM_SSM"
 
 # ---------------------------------------------------------------- БАЗА
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -43,6 +46,13 @@ q("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 q("CREATE TABLE IF NOT EXISTS users (uid INTEGER PRIMARY KEY, username TEXT, name TEXT)")
 q("CREATE TABLE IF NOT EXISTS clients (uid INTEGER PRIMARY KEY, expires REAL, "
   "interval INTEGER, last_send REAL DEFAULT 0, status TEXT DEFAULT 'active', got INTEGER DEFAULT 0)")
+
+# миграция: колонка kind (1 = КПМ1, 2 = КПМ2); старые данные становятся КПМ1
+for _t in ("stock", "channels", "clients"):
+    try:
+        q("ALTER TABLE %s ADD COLUMN kind INTEGER DEFAULT 1" % _t)
+    except Exception:
+        pass
 
 
 def get_s(key, default=None):
@@ -115,9 +125,13 @@ def claim_admin(uid):
 
 
 # ------------------------------------------------------------- УТИЛИТЫ
-states = {}  # uid -> "add_acc" | "add_ch" | "set_time" | "cl_user" | "cl_dur" | "cl_int" | "cl_setint"
-tmp = {}     # uid -> временные данные (для добавления клиента)
-notified_empty = {"v": False}
+states = {}  # uid -> "add_acc" | "add_ch" | "set_time" | "cl_user" | "cl_kind" | "cl_dur" | "cl_int" | "cl_setint"
+tmp = {}     # uid -> временные данные
+notified_empty = {1: False, 2: False}
+
+
+def kname(kind):
+    return "КПМ%d" % kind
 
 
 def fmt(ts):
@@ -157,26 +171,28 @@ def user_label(uid):
     return str(uid)
 
 
-def stock_count():
-    return q("SELECT COUNT(*) FROM stock", (), True)[0][0]
+def stock_count(kind=None):
+    if kind is None:
+        return q("SELECT COUNT(*) FROM stock", (), True)[0][0]
+    return q("SELECT COUNT(*) FROM stock WHERE kind=?", (kind,), True)[0][0]
 
 
-def take_stock():
-    """Забирает 1 аккаунт со склада (атомарно). Возвращает (id, text) или None."""
+def take_stock(kind):
+    """Забирает 1 аккаунт нужного типа со склада (атомарно). Возвращает (id, text) или None."""
     with lock:
-        row = q("SELECT id, text FROM stock ORDER BY id LIMIT 1", (), True)
+        row = q("SELECT id, text FROM stock WHERE kind=? ORDER BY id LIMIT 1", (kind,), True)
         if not row:
             return None
         q("DELETE FROM stock WHERE id=?", (row[0][0],))
         return row[0]
 
 
-def put_back(acc_id, acc):
-    q("INSERT INTO stock (id, text) VALUES (?, ?)", (acc_id, acc))
+def put_back(acc_id, acc, kind):
+    q("INSERT INTO stock (id, text, kind) VALUES (?, ?, ?)", (acc_id, acc, kind))
 
 
 def channels_list():
-    return q("SELECT chat_id, title FROM channels", (), True)
+    return q("SELECT chat_id, title, kind FROM channels", (), True)
 
 
 def interval():
@@ -203,12 +219,12 @@ def panel_text():
         left = "\n⏳ Следующая отправка в каналы через: <b>%d мин %d сек</b>" % (sec // 60, sec % 60)
     return (
         "🛠 <b>Админ-панель</b>\n\n"
-        "📦 На складе: <b>%d</b>\n"
+        "📦 Склад: КПМ1 — <b>%d</b> · КПМ2 — <b>%d</b>\n"
         "📢 Каналов: <b>%d</b>\n"
         "⏱ Интервал каналов: каждые <b>%d мин</b>\n"
         "🔁 Автоотправка в каналы: <b>%s</b>%s\n"
         "👤 Активных клиентов: <b>%d</b>"
-        % (stock_count(), len(channels_list()), interval(),
+        % (stock_count(1), stock_count(2), len(channels_list()), interval(),
            "включена ✅" if enabled() else "выключена ⏸", left, active_clients_count())
     )
 
@@ -234,75 +250,103 @@ def show_panel(chat_id, message_id=None):
         send(chat_id, panel_text(), panel_kb())
 
 
+def kind_kb(prefix):
+    return [[{"text": "КПМ1", "callback_data": "%s:1" % prefix},
+             {"text": "КПМ2", "callback_data": "%s:2" % prefix}],
+            [{"text": "⬅️ В панель", "callback_data": "back"}]]
+
+
 # ------------------------------------------------------- ОТПРАВКА В КАНАЛЫ
 def notify_admins(text):
     for a in admin_ids():
         send(a, text)
 
 
-def send_one():
-    """Берёт 1 аккаунт со склада и отправляет во все каналы.
+def send_one(auto=False):
+    """Для каждого типа (КПМ1/КПМ2) берёт 1 аккаунт со склада и отправляет в каналы этого типа.
     Возвращает (статус, подробности)."""
-    chans = channels_list()
-    if not chans:
+    chans_all = channels_list()
+    if not chans_all:
         return "nochannels", "Нет каналов. Добавьте канал."
-    row = take_stock()
-    if not row:
-        return "empty", "Склад пуст."
-    acc_id, acc = row
-    msg = "🎁 <b>Новый аккаунт</b>\n\n<code>%s</code>" % html.escape(acc)
-    ok, errs = 0, []
-    for chat_id, title in chans:
-        r = send(chat_id, msg)
-        if r.get("ok"):
-            ok += 1
+    ok_total, lines, empty_kinds, fail = 0, [], [], False
+    for kind in KINDS:
+        chans = [c for c in chans_all if c[2] == kind]
+        if not chans:
+            continue
+        row = take_stock(kind)
+        if not row:
+            empty_kinds.append(kind)
+            lines.append("%s: склад пуст" % kname(kind))
+            continue
+        acc_id, acc = row
+        msg = "🎁 <b>Новый аккаунт</b>\n\n<code>%s</code>" % html.escape(acc)
+        ok, errs = 0, []
+        for chat_id, title, _k in chans:
+            r = send(chat_id, msg)
+            if r.get("ok"):
+                ok += 1
+            else:
+                errs.append("%s: %s" % (title or chat_id, r.get("description")))
+        if ok == 0:
+            put_back(acc_id, acc, kind)
+            fail = True
+            lines.append("%s: не отправлено\n%s" % (kname(kind), "\n".join(errs)))
         else:
-            errs.append("%s: %s" % (title or chat_id, r.get("description")))
-    if ok == 0:
-        put_back(acc_id, acc)
-        return "fail", "\n".join(errs)
-    set_s("last_send", time.time())
-    return "ok", "Отправлено в каналов: %d%s" % (
-        ok, ("\n⚠️ Ошибки:\n" + "\n".join(errs)) if errs else "")
+            ok_total += ok
+            notified_empty[kind] = False
+            lines.append("%s: отправлено в каналов: %d%s" % (
+                kname(kind), ok, ("\n⚠️ Ошибки:\n" + "\n".join(errs)) if errs else ""))
+    if auto:
+        for k in empty_kinds:
+            if not notified_empty[k]:
+                notified_empty[k] = True
+                notify_admins("⚠️ Склад %s пуст! Добавьте аккаунты." % kname(k))
+    info = "\n".join(lines)
+    if ok_total:
+        set_s("last_send", time.time())
+        return "ok", info
+    if empty_kinds and not fail:
+        return "empty", info
+    return "fail", info
 
 
 # ------------------------------------------------------ ОТПРАВКА КЛИЕНТАМ
-def deliver_to_client(cid, expires):
-    """Отправляет 1 аккаунт клиенту. Возвращает 'ok' | 'empty' | 'fail'."""
-    row = take_stock()
+def deliver_to_client(cid, expires, kind):
+    """Отправляет 1 аккаунт клиенту. Возвращает ('ok' | 'empty' | 'fail', описание)."""
+    row = take_stock(kind)
     if not row:
         return "empty", ""
     acc_id, acc = row
-    msg = ("🎁 <b>Ваш новый аккаунт</b>\n\n<code>%s</code>\n\n"
-           "⏳ Подписка до: <b>%s</b>" % (html.escape(acc), fmt(expires)))
+    msg = ("🎁 <b>Ваш новый аккаунт</b> (%s)\n\n<code>%s</code>\n\n"
+           "⏳ Подписка до: <b>%s</b>" % (kname(kind), html.escape(acc), fmt(expires)))
     r = send(cid, msg)
     if r.get("ok"):
         q("UPDATE clients SET last_send=?, got=got+1 WHERE uid=?", (time.time(), cid))
+        notified_empty[kind] = False
         return "ok", ""
-    put_back(acc_id, acc)
+    put_back(acc_id, acc, kind)
     q("UPDATE clients SET last_send=? WHERE uid=?", (time.time(), cid))
     return "fail", str(r.get("description"))
 
 
 def clients_tick():
     now = time.time()
-    rows = q("SELECT uid, expires, interval, last_send, status FROM clients", (), True)
-    for cid, exp, iv, last, st in rows:
+    rows = q("SELECT uid, expires, interval, last_send, status, kind FROM clients", (), True)
+    for cid, exp, iv, last, st, kind in rows:
         if st != "active":
             continue
         if now >= exp:
             q("UPDATE clients SET status='expired' WHERE uid=?", (cid,))
-            send(cid, "⌛️ Ваша подписка закончилась. Для продления напишите администратору.")
+            send(cid, "⌛️ Ваша подписка закончилась.\n\n💳 Для продления пишите: %s" % SUPPORT_USER)
             notify_admins("⌛️ Подписка клиента <b>%s</b> закончилась." % html.escape(user_label(cid)))
             continue
         if now - last >= iv * 60:
-            st2, info = deliver_to_client(cid, exp)
+            st2, info = deliver_to_client(cid, exp, kind)
             if st2 == "empty":
-                if not notified_empty["v"]:
-                    notified_empty["v"] = True
-                    notify_admins("⚠️ Склад пуст! Клиенты не получают аккаунты. Добавьте аккаунты.")
-            elif st2 == "ok":
-                notified_empty["v"] = False
+                if not notified_empty.get(kind):
+                    notified_empty[kind] = True
+                    notify_admins("⚠️ Склад %s пуст! Клиенты %s не получают аккаунты. Добавьте аккаунты."
+                                  % (kname(kind), kname(kind)))
             elif st2 == "fail":
                 notify_admins("⚠️ Не удалось отправить клиенту <b>%s</b>:\n%s"
                               % (html.escape(user_label(cid)), html.escape(info)))
@@ -315,14 +359,8 @@ def auto_loop():
             if enabled():
                 last = float(get_s("last_send", time.time()))
                 if time.time() - last >= interval() * 60:
-                    st, info = send_one()
-                    if st == "empty":
-                        if not notified_empty["v"]:
-                            notified_empty["v"] = True
-                            notify_admins("⚠️ Склад пуст! Добавьте аккаунты.")
-                    elif st == "ok":
-                        notified_empty["v"] = False
-                    elif st in ("fail", "nochannels"):
+                    st, info = send_one(auto=True)
+                    if st in ("fail", "nochannels"):
                         set_s("last_send", time.time())
                         notify_admins("⚠️ Автоотправка не удалась:\n" + html.escape(info))
         except Exception as e:
@@ -359,22 +397,24 @@ def resolve_channel(msg):
 
 
 def add_channel(msg):
+    """Возвращает (ok, текст, chat_id, title)."""
     ref = resolve_channel(msg)
     if ref is None:
-        return "❌ Не понял. Отправьте @username канала или перешлите любой пост из канала."
+        return False, "❌ Не понял. Отправьте @username канала или перешлите любой пост из канала.", None, None
     r = api("getChat", chat_id=ref)
     if not r.get("ok"):
-        return "❌ Канал не найден: %s\nДобавьте бота в канал как администратора и попробуйте снова." % html.escape(str(r.get("description")))
+        return False, "❌ Канал не найден: %s\nДобавьте бота в канал как администратора и попробуйте снова." % html.escape(str(r.get("description"))), None, None
     chat = r["result"]
     m = api("getChatMember", chat_id=chat["id"], user_id=BOT_ID["v"])
     mem = m.get("result", {}) if m.get("ok") else {}
     if mem.get("status") not in ("administrator", "creator"):
-        return "❌ Бот не администратор в этом канале. Сделайте бота админом (с правом публикации) и попробуйте снова."
+        return False, "❌ Бот не администратор в этом канале. Сделайте бота админом (с правом публикации) и попробуйте снова.", None, None
     if mem.get("status") == "administrator" and mem.get("can_post_messages") is False:
-        return "❌ У бота нет права «Публикация сообщений». Включите его и попробуйте снова."
+        return False, "❌ У бота нет права «Публикация сообщений». Включите его и попробуйте снова.", None, None
     title = chat.get("title") or chat.get("username") or str(chat["id"])
-    q("INSERT OR REPLACE INTO channels (chat_id, title) VALUES (?, ?)", (chat["id"], title))
-    return "✅ Канал добавлен: <b>%s</b>" % html.escape(title)
+    q("INSERT OR IGNORE INTO channels (chat_id, title, kind) VALUES (?, ?, 1)", (chat["id"], title))
+    q("UPDATE channels SET title=? WHERE chat_id=?", (title, chat["id"]))
+    return True, "✅ Канал добавлен: <b>%s</b>" % html.escape(title), chat["id"], title
 
 
 # --------------------------------------------------------------- КЛИЕНТЫ
@@ -417,10 +457,10 @@ def status_icon(st, exp):
 
 
 def clients_text_kb():
-    rows = q("SELECT uid, expires, status FROM clients ORDER BY expires DESC LIMIT 40", (), True)
+    rows = q("SELECT uid, expires, status, kind FROM clients ORDER BY expires DESC LIMIT 40", (), True)
     kb = [[{"text": "➕ Добавить клиента", "callback_data": "cl_add"}]]
-    for cid, exp, st in rows:
-        kb.append([{"text": "%s %s · до %s" % (status_icon(st, exp), user_label(cid), fmt(exp)),
+    for cid, exp, st, kind in rows:
+        kb.append([{"text": "%s %s · %s · до %s" % (status_icon(st, exp), user_label(cid), kname(kind), fmt(exp)),
                     "callback_data": "cl:%d" % cid}])
     kb.append([{"text": "⬅️ В панель", "callback_data": "back"}])
     text = "👤 <b>Клиенты</b>: %d (активных: %d)" % (len(rows), active_clients_count())
@@ -430,23 +470,26 @@ def clients_text_kb():
 
 
 def client_text_kb(cid):
-    r = q("SELECT expires, interval, status, got FROM clients WHERE uid=?", (cid,), True)
+    r = q("SELECT expires, interval, status, got, kind FROM clients WHERE uid=?", (cid,), True)
     if not r:
         return "Клиент не найден.", [[{"text": "⬅️ К клиентам", "callback_data": "clients"}]]
-    exp, iv, st, got = r[0]
+    exp, iv, st, got, kind = r[0]
     names = {"active": "активна ✅", "paused": "на паузе ⏸", "expired": "закончилась 🔴"}
+    other = 2 if kind == 1 else 1
     text = ("👤 <b>%s</b> (<code>%d</code>)\n\n"
+            "Тип: <b>%s</b>\n"
             "Подписка: <b>%s</b>\n"
             "До: <b>%s</b>\n"
             "Осталось: <b>%s</b>\n"
             "Интервал: каждые <b>%d мин</b>\n"
             "Получено аккаунтов: <b>%d</b>"
-            % (html.escape(user_label(cid)), cid, names.get(st, st), fmt(exp),
+            % (html.escape(user_label(cid)), cid, kname(kind), names.get(st, st), fmt(exp),
                left_str(exp - time.time()) if exp > time.time() else "0", iv, got))
     kb = [
         [{"text": "+1 час", "callback_data": "ext:%d:1" % cid},
          {"text": "+1 день", "callback_data": "ext:%d:24" % cid},
          {"text": "+7 дней", "callback_data": "ext:%d:168" % cid}],
+        [{"text": "🔀 Сменить на %s" % kname(other), "callback_data": "ckind:%d" % cid}],
         [{"text": "⏱ Интервал", "callback_data": "cint:%d" % cid},
          {"text": "▶️ Продолжить" if st == "paused" else "⏸ Пауза", "callback_data": "ctog:%d" % cid}],
         [{"text": "🗑 Удалить", "callback_data": "cdel:%d" % cid}],
@@ -461,9 +504,27 @@ def interval_kb():
             [{"text": "⬅️ В панель", "callback_data": "back"}]]
 
 
+def ask_duration(chat_id, uid):
+    d = tmp.get(uid) or {}
+    states[uid] = "cl_dur"
+    kb = [[{"text": "1 день", "callback_data": "cd:24"},
+           {"text": "3 дня", "callback_data": "cd:72"}],
+          [{"text": "7 дней", "callback_data": "cd:168"},
+           {"text": "30 дней", "callback_data": "cd:720"}],
+          [{"text": "⬅️ В панель", "callback_data": "back"}]]
+    send(chat_id, "👤 Клиент: <b>%s</b> · <b>%s</b>\n\n⏳ На какой срок подписка? Выберите или отправьте число дней "
+                  "(например <b>2</b>) либо часов (например <b>5ч</b>)."
+         % (html.escape(user_label(d.get("cid"))), kname(d.get("kind", 1))), kb)
+
+
+def set_client_kind(uid, chat_id, kind):
+    tmp.setdefault(uid, {})["kind"] = kind
+    ask_duration(chat_id, uid)
+
+
 def finish_client(admin_uid, chat_id, minutes):
     d = tmp.get(admin_uid) or {}
-    cid, hours = d.get("cid"), d.get("hours")
+    cid, hours, kind = d.get("cid"), d.get("hours"), d.get("kind", 1)
     states.pop(admin_uid, None)
     tmp.pop(admin_uid, None)
     if not cid or not hours:
@@ -471,46 +532,35 @@ def finish_client(admin_uid, chat_id, minutes):
         show_panel(chat_id)
         return
     exp = time.time() + hours * 3600
-    q("INSERT OR REPLACE INTO clients (uid, expires, interval, last_send, status, got) "
-      "VALUES (?, ?, ?, 0, 'active', COALESCE((SELECT got FROM clients WHERE uid=?), 0))",
-      (cid, exp, minutes, cid))
-    r = send(cid, "✅ <b>Подписка активирована!</b>\n\nДо: <b>%s</b>\n"
-                  "Аккаунты будут приходить сюда каждые <b>%d мин</b>." % (fmt(exp), minutes))
+    q("INSERT OR REPLACE INTO clients (uid, expires, interval, last_send, status, got, kind) "
+      "VALUES (?, ?, ?, 0, 'active', COALESCE((SELECT got FROM clients WHERE uid=?), 0), ?)",
+      (cid, exp, minutes, cid, kind))
+    r = send(cid, "✅ <b>Подписка активирована!</b>\n\nТип: <b>%s</b>\nДо: <b>%s</b>\n"
+                  "Аккаунты будут приходить сюда каждые <b>%d мин</b>." % (kname(kind), fmt(exp), minutes))
     warn = "" if r.get("ok") else "\n⚠️ Клиенту не удалось отправить сообщение: %s" % html.escape(str(r.get("description")))
-    send(chat_id, "✅ Клиент <b>%s</b> добавлен.\nДо: <b>%s</b>, интервал: <b>%d мин</b>.%s"
-         % (html.escape(user_label(cid)), fmt(exp), minutes, warn))
+    send(chat_id, "✅ Клиент <b>%s</b> добавлен (%s).\nДо: <b>%s</b>, интервал: <b>%d мин</b>.%s"
+         % (html.escape(user_label(cid)), kname(kind), fmt(exp), minutes, warn))
     text, kb = clients_text_kb()
     send(chat_id, text, kb)
 
 
-SUPPORT_USER = "@CPM_SSM"
-SUPPORT_URL = "https://t.me/CPM_SSM"
-
-
-def buy_kb(text="💳 Купить доступ"):
-    return [[{"text": text, "url": SUPPORT_URL}]]
-
-
 def my_status(chat_id, uid):
-    r = q("SELECT expires, interval, status FROM clients WHERE uid=?", (uid,), True)
+    r = q("SELECT expires, interval, status, kind FROM clients WHERE uid=?", (uid,), True)
     if not r:
         send(chat_id,
              "👋 <b>Добро пожаловать!</b>\n\n"
              "🎁 Свежие аккаунты приходят прямо в этот чат автоматически.\n\n"
-             "💳 Для покупки доступа пишите: %s" % SUPPORT_USER,
-             buy_kb())
+             "💳 Для покупки доступа пишите: %s" % SUPPORT_USER)
         return
-    exp, iv, st = r[0]
+    exp, iv, st, kind = r[0]
     if st == "active" and exp > time.time():
-        send(chat_id, "👋 Привет!\n\n✅ Подписка активна до <b>%s</b>\n⏳ Осталось: <b>%s</b>\n"
-                      "🔁 Аккаунты приходят каждые <b>%d мин</b>." % (fmt(exp), left_str(exp - time.time()), iv),
-             buy_kb("🔄 Продлить"))
+        send(chat_id, "👋 Привет!\n\n✅ Подписка активна (<b>%s</b>) до <b>%s</b>\n⏳ Осталось: <b>%s</b>\n"
+                      "🔁 Аккаунты приходят каждые <b>%d мин</b>."
+             % (kname(kind), fmt(exp), left_str(exp - time.time()), iv))
     elif st == "paused":
-        send(chat_id, "⏸ Ваша подписка сейчас на паузе. Напишите %s" % SUPPORT_USER,
-             buy_kb("💬 Написать"))
+        send(chat_id, "⏸ Ваша подписка сейчас на паузе. Напишите %s" % SUPPORT_USER)
     else:
-        send(chat_id, "⌛️ Ваша подписка закончилась.\n\n💳 Для продления пишите: %s" % SUPPORT_USER,
-             buy_kb("🔄 Продлить"))
+        send(chat_id, "⌛️ Ваша подписка закончилась.\n\n💳 Для продления пишите: %s" % SUPPORT_USER)
 
 
 # ------------------------------------------------------------- ХЕНДЛЕРЫ
@@ -555,25 +605,29 @@ def handle_message(msg):
     st = states.get(uid)
 
     if st == "add_acc":
+        kind = (tmp.get(uid) or {}).get("kind", 1)
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         if not lines:
             send(chat_id, "❌ Отправьте текст аккаунта (каждый аккаунт с новой строки).")
             return
         with lock:
             for l in lines:
-                q("INSERT INTO stock (text) VALUES (?)", (l,))
+                q("INSERT INTO stock (text, kind) VALUES (?, ?)", (l, kind))
         states.pop(uid, None)
-        notified_empty["v"] = False
-        send(chat_id, "✅ Добавлено: <b>%d</b>\n📦 Всего на складе: <b>%d</b>" % (len(lines), stock_count()))
+        tmp.pop(uid, None)
+        notified_empty[kind] = False
+        send(chat_id, "✅ Добавлено в %s: <b>%d</b>\n📦 Всего в %s: <b>%d</b>"
+             % (kname(kind), len(lines), kname(kind), stock_count(kind)))
         show_panel(chat_id)
         return
 
     if st == "add_ch":
-        res = add_channel(msg)
-        if res.startswith("✅"):
+        ok, res, chat_id_new, title = add_channel(msg)
+        if ok:
             states.pop(uid, None)
-            send(chat_id, res)
-            show_panel(chat_id)
+            kb = [[{"text": "КПМ1", "callback_data": "chk:%d:1" % chat_id_new},
+                   {"text": "КПМ2", "callback_data": "chk:%d:2" % chat_id_new}]]
+            send(chat_id, res + "\n\nКакой тип аккаунтов отправлять в этот канал?", kb)
         else:
             send(chat_id, res + "\n\nИли /cancel для отмены.")
         return
@@ -601,17 +655,20 @@ def handle_message(msg):
                           "и нажмёт /start, потом добавьте его.\n\n/cancel — отмена")
             return
         tmp[uid] = {"cid": cid}
-        states[uid] = "cl_dur"
-        kb = [[{"text": "1 день", "callback_data": "cd:24"},
-               {"text": "3 дня", "callback_data": "cd:72"}],
-              [{"text": "7 дней", "callback_data": "cd:168"},
-               {"text": "30 дней", "callback_data": "cd:720"}],
-              [{"text": "⬅️ В панель", "callback_data": "back"}]]
-        send(chat_id, "👤 Клиент: <b>%s</b>\n\n⏳ На какой срок подписка? Выберите или отправьте число дней "
-                      "(например <b>2</b>) либо часов (например <b>5ч</b>)." % html.escape(user_label(cid)), kb)
+        states[uid] = "cl_kind"
+        send(chat_id, "👤 Клиент: <b>%s</b>\n\nКакой тип аккаунтов он купил?" % html.escape(user_label(cid)),
+             kind_kb("ck"))
         return
 
-    # ---- шаг 2 - срок
+    # ---- шаг 2 - тип (можно текстом 1 или 2)
+    if st == "cl_kind":
+        if text in ("1", "2"):
+            set_client_kind(uid, chat_id, int(text))
+        else:
+            send(chat_id, "❌ Выберите КПМ1 или КПМ2 кнопкой (или отправьте <b>1</b> / <b>2</b>).")
+        return
+
+    # ---- шаг 3 - срок
     if st == "cl_dur":
         h = parse_hours(text)
         if not h:
@@ -623,7 +680,7 @@ def handle_message(msg):
              interval_kb())
         return
 
-    # ---- шаг 3 - интервал
+    # ---- шаг 4 - интервал
     if st == "cl_int":
         if text.isdigit() and int(text) >= 1:
             finish_client(uid, chat_id, int(text))
@@ -661,16 +718,75 @@ def handle_callback(cb):
         tmp.pop(uid, None)
         show_panel(chat_id, mid)
 
+    # ------------------------------------------------------- АККАУНТЫ
     elif data == "add_acc":
-        states[uid] = "add_acc"
-        send(chat_id, "➕ Отправьте аккаунт(ы).\nКаждый аккаунт — с новой строки.\n\n/cancel — отмена")
+        edit(chat_id, mid, "➕ В какой склад добавить аккаунты?", kind_kb("acc"))
 
+    elif data.startswith("acc:"):
+        kind = int(data[4:])
+        states[uid] = "add_acc"
+        tmp[uid] = {"kind": kind}
+        send(chat_id, "➕ Склад <b>%s</b>.\nОтправьте аккаунт(ы), каждый — с новой строки.\n\n/cancel — отмена"
+             % kname(kind))
+
+    elif data == "stock":
+        parts = []
+        for k in KINDS:
+            rows = q("SELECT id, text FROM stock WHERE kind=? ORDER BY id LIMIT 5", (k,), True)
+            body = "\n".join("%d. <code>%s</code>" % (i + 1, html.escape(t[:60])) for i, (_, t) in enumerate(rows)) or "пусто"
+            parts.append("📦 <b>%s: %d</b>\n%s" % (kname(k), stock_count(k), body))
+        kb = [[{"text": "🗑 Очистить КПМ1", "callback_data": "cs:1"},
+               {"text": "🗑 Очистить КПМ2", "callback_data": "cs:2"}],
+              [{"text": "⬅️ В панель", "callback_data": "back"}]]
+        edit(chat_id, mid, "\n\n".join(parts), kb)
+
+    elif data.startswith("cs:"):
+        k = int(data[3:])
+        kb = [[{"text": "✅ Да, очистить", "callback_data": "csy:%d" % k},
+               {"text": "❌ Нет", "callback_data": "stock"}]]
+        edit(chat_id, mid, "Точно очистить склад <b>%s</b>?" % kname(k), kb)
+
+    elif data.startswith("csy:"):
+        q("DELETE FROM stock WHERE kind=?", (int(data[4:]),))
+        show_panel(chat_id, mid)
+
+    # --------------------------------------------------------- КАНАЛЫ
     elif data == "add_ch":
         states[uid] = "add_ch"
         send(chat_id,
              "📢 Сначала добавьте бота в канал как <b>администратора</b> (с правом публикации).\n\n"
              "Потом отправьте <b>@username</b> канала или <b>перешлите любой пост</b> из канала.\n\n/cancel — отмена")
 
+    elif data.startswith("chk:"):
+        _, cid, k = data.split(":")
+        q("UPDATE channels SET kind=? WHERE chat_id=?", (int(k), int(cid)))
+        send(chat_id, "✅ Канал будет получать аккаунты <b>%s</b>." % kname(int(k)))
+        show_panel(chat_id)
+
+    elif data.startswith("chkt:"):
+        cid = int(data[5:])
+        r = q("SELECT kind FROM channels WHERE chat_id=?", (cid,), True)
+        if r:
+            q("UPDATE channels SET kind=? WHERE chat_id=?", (2 if r[0][0] == 1 else 1, cid))
+        cb["data"] = "channels"
+        handle_callback(cb)
+
+    elif data == "channels":
+        rows = channels_list()
+        kb = []
+        for c, t, k in rows:
+            kb.append([{"text": "🗑 %s" % (t or c), "callback_data": "delch:%d" % c},
+                       {"text": "%s 🔀" % kname(k), "callback_data": "chkt:%d" % c}])
+        kb.append([{"text": "⬅️ В панель", "callback_data": "back"}])
+        edit(chat_id, mid,
+             "📋 <b>Каналы</b>\n🗑 — удалить, КПМ 🔀 — сменить тип:" if rows else "📋 Каналов нет.", kb)
+
+    elif data.startswith("delch:"):
+        q("DELETE FROM channels WHERE chat_id=?", (int(data[6:]),))
+        cb["data"] = "channels"
+        handle_callback(cb)
+
+    # ------------------------------------------------ ВРЕМЯ / ВКЛ / СЕЙЧАС
     elif data == "set_time":
         states[uid] = "set_time"
         kb = [[{"text": "%d мин" % m, "callback_data": "t:%d" % m} for m in (1, 5, 10)],
@@ -692,33 +808,6 @@ def handle_callback(cb):
             set_s("last_send", time.time())
         show_panel(chat_id, mid)
 
-    elif data == "stock":
-        rows = q("SELECT id, text FROM stock ORDER BY id LIMIT 10", (), True)
-        body = "\n".join("%d. <code>%s</code>" % (i + 1, html.escape(t[:60])) for i, (_, t) in enumerate(rows)) or "пусто"
-        kb = [[{"text": "🗑 Очистить склад", "callback_data": "clear_stock"}],
-              [{"text": "⬅️ В панель", "callback_data": "back"}]]
-        edit(chat_id, mid, "📦 <b>Склад: %d</b>\n\n%s" % (stock_count(), body), kb)
-
-    elif data == "clear_stock":
-        kb = [[{"text": "✅ Да, очистить", "callback_data": "clear_yes"},
-               {"text": "❌ Нет", "callback_data": "stock"}]]
-        edit(chat_id, mid, "Точно очистить весь склад?", kb)
-
-    elif data == "clear_yes":
-        q("DELETE FROM stock")
-        show_panel(chat_id, mid)
-
-    elif data == "channels":
-        rows = channels_list()
-        kb = [[{"text": "🗑 %s" % (t or c), "callback_data": "delch:%d" % c}] for c, t in rows]
-        kb.append([{"text": "⬅️ В панель", "callback_data": "back"}])
-        edit(chat_id, mid, "📋 <b>Каналы</b> (нажмите, чтобы удалить):" if rows else "📋 Каналов нет.", kb)
-
-    elif data.startswith("delch:"):
-        q("DELETE FROM channels WHERE chat_id=?", (int(data[6:]),))
-        cb["data"] = "channels"
-        handle_callback(cb)
-
     elif data == "send_now":
         st, info = send_one()
         send(chat_id, ("✅ " if st == "ok" else "⚠️ ") + html.escape(info))
@@ -735,6 +824,10 @@ def handle_callback(cb):
         states[uid] = "cl_user"
         send(chat_id, "👤 Отправьте <b>ID</b> или <b>@username</b> клиента, либо <b>перешлите его сообщение</b>.\n\n"
                       "⚠️ Клиент должен сначала открыть бота и нажать /start.\n\n/cancel — отмена")
+
+    elif data.startswith("ck:"):
+        if states.get(uid) == "cl_kind":
+            set_client_kind(uid, chat_id, int(data[3:]))
 
     elif data.startswith("cd:"):
         if states.get(uid) == "cl_dur":
@@ -758,6 +851,16 @@ def handle_callback(cb):
 
     elif data.startswith("cl:"):
         t, kb = client_text_kb(int(data[3:]))
+        edit(chat_id, mid, t, kb)
+
+    elif data.startswith("ckind:"):
+        cid = int(data[6:])
+        r = q("SELECT kind FROM clients WHERE uid=?", (cid,), True)
+        if r:
+            new_k = 2 if r[0][0] == 1 else 1
+            q("UPDATE clients SET kind=? WHERE uid=?", (new_k, cid))
+            send(cid, "🔀 Ваш тип аккаунтов изменён на <b>%s</b>." % kname(new_k))
+        t, kb = client_text_kb(cid)
         edit(chat_id, mid, t, kb)
 
     elif data.startswith("ext:"):
