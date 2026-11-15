@@ -483,19 +483,34 @@ def finish_client(admin_uid, chat_id, minutes):
     send(chat_id, text, kb)
 
 
+SUPPORT_USER = "@CPM_SSM"
+SUPPORT_URL = "https://t.me/CPM_SSM"
+
+
+def buy_kb(text="💳 Купить доступ"):
+    return [[{"text": text, "url": SUPPORT_URL}]]
+
+
 def my_status(chat_id, uid):
     r = q("SELECT expires, interval, status FROM clients WHERE uid=?", (uid,), True)
     if not r:
-        send(chat_id, "👋 Привет! У вас нет активной подписки. Для доступа напишите администратору.")
+        send(chat_id,
+             "👋 <b>Добро пожаловать!</b>\n\n"
+             "🎁 Свежие аккаунты приходят прямо в этот чат автоматически.\n\n"
+             "💳 Для покупки доступа пишите: %s" % SUPPORT_USER,
+             buy_kb())
         return
     exp, iv, st = r[0]
     if st == "active" and exp > time.time():
         send(chat_id, "👋 Привет!\n\n✅ Подписка активна до <b>%s</b>\n⏳ Осталось: <b>%s</b>\n"
-                      "🔁 Аккаунты приходят каждые <b>%d мин</b>." % (fmt(exp), left_str(exp - time.time()), iv))
+                      "🔁 Аккаунты приходят каждые <b>%d мин</b>." % (fmt(exp), left_str(exp - time.time()), iv),
+             buy_kb("🔄 Продлить"))
     elif st == "paused":
-        send(chat_id, "⏸ Ваша подписка сейчас на паузе. Напишите администратору.")
+        send(chat_id, "⏸ Ваша подписка сейчас на паузе. Напишите %s" % SUPPORT_USER,
+             buy_kb("💬 Написать"))
     else:
-        send(chat_id, "⌛️ Ваша подписка закончилась. Для продления напишите администратору.")
+        send(chat_id, "⌛️ Ваша подписка закончилась.\n\n💳 Для продления пишите: %s" % SUPPORT_USER,
+             buy_kb("🔄 Продлить"))
 
 
 # ------------------------------------------------------------- ХЕНДЛЕРЫ
